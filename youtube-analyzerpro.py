@@ -1,222 +1,123 @@
 import streamlit as st
 from googleapiclient.discovery import build
-from datetime import datetime, timezone
-from textblob import TextBlob
 import pandas as pd
-import matplotlib.pyplot as plt
-from wordcloud import WordCloud
 import openai
+from wordcloud import WordCloud
+import matplotlib.pyplot as plt
+import re
 
-# --- CONFIG ---
-st.set_page_config(page_title="YouTube Analyzer + AI Features", layout="wide")
+# ------------------- SIDEBAR ---------------------
+st.sidebar.title("🔐 API Configuration")
+yt_api_key = st.sidebar.text_input("🔑 YouTube API Key", type="password")
+openai_api_key = st.sidebar.text_input("🧠 OpenAI API Key", type="password")
+openai.api_key = openai_api_key
 
-# --- SESSION STATE ---
-if "api_keys" not in st.session_state:
-    st.session_state.api_keys = []
-if "selected_key_idx" not in st.session_state:
-    st.session_state.selected_key_idx = 0
-
-# --- SIDEBAR: API Keys and OpenAI key ---
-st.sidebar.title("Settings & API Keys")
-# Input Youtube API Keys
-new_key = st.sidebar.text_input("Tambah YouTube API Key (max 5)", type="password")
-if st.sidebar.button("Tambah API Key"):
-    if len(st.session_state.api_keys) >= 5:
-        st.sidebar.warning("Maksimal 5 API Key.")
-    elif new_key.strip():
-        st.session_state.api_keys.append(new_key.strip())
-        st.sidebar.success("API Key ditambahkan.")
-# Pilih API Key
-if st.session_state.api_keys:
-    st.session_state.selected_key_idx = st.sidebar.selectbox(
-        "Pilih API Key",
-        options=range(len(st.session_state.api_keys)),
-        format_func=lambda i: f"Key {i+1} (****{st.session_state.api_keys[i][-5:]})",
-        index=st.session_state.selected_key_idx,
-    )
-youtube_api_key = st.session_state.api_keys[st.session_state.selected_key_idx] if st.session_state.api_keys else None
-
-# Input OpenAI API Key for AI features
-openai_api_key = st.sidebar.text_input("OpenAI API Key (untuk AI rekomendasi judul)", type="password")
-
-# --- YouTube API Helper ---
-def get_youtube_client():
-    if youtube_api_key:
-        return build("youtube", "v3", developerKey=youtube_api_key)
-    else:
-        return None
-
-def fetch_videos(youtube, query=None, channel_id=None, max_results=20, order="relevance"):
-    try:
-        if channel_id:
-            # Get videos from channel
-            search_response = youtube.search().list(
-                channelId=channel_id,
-                part="id,snippet",
-                maxResults=max_results,
-                order="date"
-            ).execute()
-        else:
-            search_response = youtube.search().list(
-                q=query,
-                part="id,snippet",
-                maxResults=max_results,
-                order=order
-            ).execute()
-        video_ids = [item['id']['videoId'] for item in search_response['items'] if item['id']['kind']=='youtube#video']
-        if not video_ids:
-            return []
-        videos_response = youtube.videos().list(
-            id=",".join(video_ids),
-            part="snippet,statistics"
-        ).execute()
-        videos = []
-        for item in videos_response["items"]:
-            published = item['snippet']['publishedAt']
-            published_dt = datetime.strptime(published, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
-            days_old = (datetime.now(timezone.utc) - published_dt).days + 1
-            views = int(item['statistics'].get('viewCount', 0))
-            likes = int(item['statistics'].get('likeCount', 0))
-            comments = int(item['statistics'].get('commentCount', 0))
+# ------------------- FUNCTION ---------------------
+@st.cache_data(show_spinner=False)
+def get_channel_videos(channel_id, max_results=30):
+    youtube = build('youtube', 'v3', developerKey=yt_api_key)
+    req = youtube.search().list(part='snippet', channelId=channel_id, maxResults=max_results, order='date')
+    res = req.execute()
+    videos = []
+    for item in res['items']:
+        if item['id']['kind'] == 'youtube#video':
             videos.append({
-                "video_id": item['id'],
-                "title": item['snippet']['title'],
-                "channel_title": item['snippet']['channelTitle'],
-                "published": published_dt.strftime("%Y-%m-%d"),
-                "days_old": days_old,
-                "views": views,
-                "likes": likes,
-                "comments": comments,
-                "views_per_day": views / days_old if days_old > 0 else views,
-                "thumbnail": item['snippet']['thumbnails']['medium']['url']
+                'title': item['snippet']['title'],
+                'videoId': item['id']['videoId'],
+                'publishedAt': item['snippet']['publishedAt'],
+                'thumbnail': item['snippet']['thumbnails']['medium']['url']
             })
-        return videos
-    except Exception as e:
-        st.error(f"Error fetching videos: {e}")
-        return []
+    return videos
 
-# --- AI Title Generator ---
-def generate_ai_titles(prompt, openai_key, n=5):
-    import openai
-    openai.api_key = openai_key
-    try:
-        response = openai.Completion.create(
-            engine="text-davinci-003",
-            prompt=f"Buat {n} judul video YouTube menarik dan SEO friendly berdasarkan keyword: {prompt}",
-            max_tokens=150,
-            n=n,
-            stop=None,
-            temperature=0.7,
-        )
-        titles = [choice['text'].strip() for choice in response['choices']]
-        return titles
-    except Exception as e:
-        st.error(f"OpenAI API Error: {e}")
-        return []
+def search_videos_by_keyword(keyword, max_results=30):
+    youtube = build('youtube', 'v3', developerKey=yt_api_key)
+    req = youtube.search().list(part='snippet', q=keyword, maxResults=max_results, order='relevance')
+    res = req.execute()
+    videos = []
+    for item in res['items']:
+        if item['id']['kind'] == 'youtube#video':
+            videos.append({
+                'title': item['snippet']['title'],
+                'videoId': item['id']['videoId'],
+                'channelTitle': item['snippet']['channelTitle'],
+                'publishedAt': item['snippet']['publishedAt'],
+                'thumbnail': item['snippet']['thumbnails']['medium']['url']
+            })
+    return videos
 
-# --- Prediksi sederhana berdasarkan views_per_day rata-rata ---
-def predict_performance(df):
-    if df.empty:
-        return "Data tidak cukup untuk prediksi."
-    avg_vpd = df["views_per_day"].mean()
-    if avg_vpd > 1000:
-        return "Performa video diperkirakan sangat baik (views/hari tinggi)."
-    elif avg_vpd > 100:
-        return "Performa video diperkirakan baik."
-    else:
-        return "Performa video diperkirakan rendah."
+def generate_wordcloud(titles):
+    text = " ".join(titles)
+    wordcloud = WordCloud(width=800, height=400, background_color='white').generate(text)
+    return wordcloud
 
-# --- MAIN UI ---
-st.title("YouTube Analyzer dengan Fitur AI dan Kompetitor")
+def recommend_with_openai(prompt):
+    if not openai_api_key:
+        return "Masukkan API Key OpenAI dulu."
+    response = openai.chat.completions.create(
+        model="gpt-4",
+        messages=[{"role": "user", "content": prompt}]
+    )
+    return response.choices[0].message.content.strip()
 
-if not youtube_api_key:
-    st.warning("Masukkan YouTube API Key di sidebar untuk menggunakan aplikasi ini.")
-    st.stop()
+# ------------------- UI ---------------------
+st.title("📊 YouTube Analyzer Pro")
 
-youtube = get_youtube_client()
-if not youtube:
-    st.error("Gagal membuat klien YouTube API.")
-    st.stop()
+menu = st.selectbox("🔍 Pilih Mode Analisa", ["🔑 Berdasarkan Keyword", "📺 Berdasarkan Channel ID"])
 
-with st.form("search_form"):
-    query = st.text_input("Masukkan Keyword pencarian YouTube")
-    channel_id = st.text_input("Atau masukkan Channel ID kompetitor (opsional)")
-    submitted = st.form_submit_button("Cari")
+if menu == "📺 Berdasarkan Channel ID":
+    channel_id = st.text_input("Masukkan Channel ID YouTube:")
+    if channel_id and yt_api_key:
+        videos = get_channel_videos(channel_id)
+        if videos:
+            df = pd.DataFrame(videos)
+            st.subheader("📹 Video Terbaru")
+            for _, row in df.iterrows():
+                st.image(row['thumbnail'], width=300)
+                st.markdown(f"**{row['title']}**")
+                st.markdown(f"[Tonton di YouTube](https://youtube.com/watch?v={row['videoId']})")
 
-if submitted:
-    videos_main = []
-    if query:
-        videos_main = fetch_videos(youtube, query=query, max_results=30)
-    elif channel_id:
-        videos_main = fetch_videos(youtube, channel_id=channel_id, max_results=30)
-    else:
-        st.warning("Masukkan keyword pencarian atau Channel ID")
-        st.stop()
+            st.subheader("☁️ WordCloud Judul Video")
+            wc = generate_wordcloud(df['title'].tolist())
+            st.image(wc.to_array())
 
-    if not videos_main:
-        st.info("Tidak ada video ditemukan.")
-    else:
-        df = pd.DataFrame(videos_main)
-        st.subheader("Hasil Pencarian Video")
-        # Tabel data dengan link ke YouTube
-        def make_link(row):
-            url = f"https://www.youtube.com/watch?v={row['video_id']}"
-            return f"[{row['title'][:60]}...]({url})"
-        df["video_link"] = df.apply(make_link, axis=1)
-        st.dataframe(df[["video_link", "channel_title", "views", "likes", "comments", "published"]], height=400)
+            st.subheader("🧠 Rekomendasi Judul AI")
+            title_text = "\n".join(df['title'].tolist())
+            prompt = f"Berdasarkan judul-judul berikut:\n{title_text}\nBuatlah 5 rekomendasi judul baru yang menarik dan SEO friendly:"
+            ai_titles = recommend_with_openai(prompt)
+            st.write(ai_titles)
 
-        # Thumbnail grid dengan link
-        st.subheader("Thumbnail Preview")
-        cols = st.columns(5)
-        for i, video in enumerate(videos_main[:20]):
-            with cols[i % 5]:
-                st.markdown(f"[![Thumbnail]( {video['thumbnail']} )](https://www.youtube.com/watch?v={video['video_id']})")
+            st.subheader("🏷️ Rekomendasi Tag & Strategi")
+            tag_prompt = f"Berdasarkan channel dengan judul-judul:\n{title_text}\nBerikan rekomendasi tag relevan dan strategi konten yang sedang tren:"
+            tag_response = recommend_with_openai(tag_prompt)
+            st.write(tag_response)
 
-        # Analisis Sentimen judul
-        st.subheader("Analisis Sentimen Judul")
-        df["sentiment"] = df["title"].apply(lambda t: TextBlob(t).sentiment.polarity)
-        fig, ax = plt.subplots()
-        ax.hist(df["sentiment"], bins=15, color="skyblue")
-        ax.set_xlabel("Sentimen")
-        ax.set_ylabel("Jumlah Video")
-        st.pyplot(fig)
+elif menu == "🔑 Berdasarkan Keyword":
+    keyword = st.text_input("Masukkan Keyword Pencarian:")
+    if keyword and yt_api_key:
+        results = search_videos_by_keyword(keyword)
+        if results:
+            df = pd.DataFrame(results)
+            st.subheader("🔥 Video Populer Berdasarkan Keyword")
+            for _, row in df.iterrows():
+                st.image(row['thumbnail'], width=300)
+                st.markdown(f"**{row['title']}** by {row['channelTitle']}")
+                st.markdown(f"[Tonton di YouTube](https://youtube.com/watch?v={row['videoId']})")
 
-        # Wordcloud judul
-        st.subheader("Wordcloud Judul Video")
-        text_all = " ".join(df["title"])
-        wc = WordCloud(width=800, height=400, background_color="white").generate(text_all)
-        fig_wc, ax_wc = plt.subplots(figsize=(10, 5))
-        ax_wc.imshow(wc, interpolation="bilinear")
-        ax_wc.axis("off")
-        st.pyplot(fig_wc)
+            st.subheader("☁️ WordCloud Judul Video")
+            wc = generate_wordcloud(df['title'].tolist())
+            st.image(wc.to_array())
 
-        # Prediksi performa video
-        st.subheader("Prediksi Performa Video (Sederhana)")
-        pred = predict_performance(df)
-        st.info(pred)
+            st.subheader("🧠 AI Rekomendasi Judul")
+            keyword_titles = "\n".join(df['title'].tolist())
+            prompt = f"Berikut daftar judul video berdasarkan keyword '{keyword}':\n{keyword_titles}\nBuat 5 judul baru yang viral dan cocok untuk YouTube:"
+            ai_titles = recommend_with_openai(prompt)
+            st.write(ai_titles)
 
-        # AI Judul Generator
-        if openai_api_key:
-            st.subheader("Rekomendasi Judul AI")
-            ai_titles = generate_ai_titles(query if query else channel_id, openai_api_key, n=5)
-            for i, title in enumerate(ai_titles, 1):
-                st.markdown(f"{i}. **{title}**")
-        else:
-            st.info("Masukkan OpenAI API Key di sidebar untuk rekomendasi judul AI.")
+            st.subheader("📈 Strategi & Ide Konten")
+            prompt2 = f"Apa saja ide konten, tag, dan strategi untuk keyword '{keyword}' berdasarkan data ini:\n{keyword_titles}"
+            tag_response = recommend_with_openai(prompt2)
+            st.write(tag_response)
 
-        # Analisis channel kompetitor jika ada channel_id
-        if channel_id:
-            st.subheader("Video Kompetitor (Channel ID diberikan)")
-            videos_comp = fetch_videos(youtube, channel_id=channel_id, max_results=15)
-            if videos_comp:
-                df_comp = pd.DataFrame(videos_comp)
-                df_comp["video_link"] = df_comp.apply(make_link, axis=1)
-                st.dataframe(df_comp[["video_link", "views", "likes", "comments", "published"]])
-                # Thumbnail kompetitor
-                st.subheader("Thumbnail Kompetitor")
-                cols2 = st.columns(5)
-                for i, video in enumerate(videos_comp[:20]):
-                    with cols2[i % 5]:
-                        st.markdown(f"[![Thumbnail]( {video['thumbnail']} )](https://www.youtube.com/watch?v={video['video_id']})")
-            else:
-                st.info("Tidak ditemukan video kompetitor.")
+# ------------------ FOOTER -------------------
+st.markdown("---")
+st.markdown("🚀 Dibuat oleh YouTube Analyzer Pro · Powered by OpenAI & YouTube Data API")
